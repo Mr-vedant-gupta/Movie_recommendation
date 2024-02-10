@@ -1,25 +1,53 @@
 import torch
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+import os
+
+INP_DATA_PATH = 'mat_comp'
+TST_DATA_PATH = 'test_data.pt'
+TR_DATA_PATH = 'training_data.pt'
+PARAM_PATH = 'parameters.pt'
+
+RANK = 20
+EPOCHS = 10000000
+LEARNING_RATE = 0.001
+CROSS_VALIDATE = True
 
 
 # TODO: see hints
 # TODO: consider batch sizes
 class MovieRecoModel(torch.nn.Module):
-    def __init__(self, num_features, num_users, num_movies):
+    def __init__(self, num_features, num_users, num_movies, M):
         super().__init__()
         # num_features is rank
-        self.user_to_feature = nn.Parameter(torch.randn(num_users, num_features))
-        self.movie_to_feature = nn.Parameter(torch.randn(num_movies, num_features))
+        U, S, Vh = torch.linalg.svd(M)
+        # TODO: remove this assertion and make code robust
+        assert S.size(0) > num_features
+        U = U[:, :num_features]
+        S = S[:num_features]
+        Vh = Vh[:num_features, :]
+
+        self.user_to_feature = nn.Parameter(torch.randn(num_users, num_features))#nn.Parameter(U)
+        self.movie_to_feature = nn.Parameter(torch.randn(num_movies, num_features))#(torch.diag(S) @ Vh).t())
 
     def forward(self, user, movie):
         user_features = self.user_to_feature[user]
         movie_features = self.movie_to_feature[movie]
-        return torch.sum(user_features * movie_features)
+        return (user_features * movie_features).sum(1)
 
 
-def process_data(path):
-    with open(path, "r") as file:
-        print("Opened input file")
+def process_data():
+    if os.path.exists(TST_DATA_PATH) \
+            and os.path.exists(TR_DATA_PATH) \
+            and os.path.exists(PARAM_PATH):
+        print("using previously processed data")
+        training_data = torch.load(TR_DATA_PATH)
+        test_data = torch.load(TST_DATA_PATH)
+        parameters = torch.load(PARAM_PATH)
+        return parameters[0].item(), parameters[1].item(), training_data, test_data
+
+    with open(INP_DATA_PATH, "r") as file:
+        print("Could not find processed data. Processing from scratch")
         n, m, k = map(int, file.readline().split())
         training_data = torch.zeros(k, 3, dtype=torch.float32)
         for index in range(k):
@@ -32,21 +60,20 @@ def process_data(path):
             i, j = map(int, file.readline().split())
             test_data[index] = torch.tensor([i - 1, j - 1])
         # save data in files
-        torch.save(training_data, 'training_data.pt')
-        torch.save(test_data, 'test_data.pt')
+        torch.save(training_data, TR_DATA_PATH)
+        torch.save(test_data, TST_DATA_PATH)
+        torch.save(torch.tensor([n, m, k]), PARAM_PATH)
         return n, m, training_data, test_data
 
 
-def train(epochs, rank, input_file_path, learning_rate, cross_validate):
+def train():
     # TODO: check if path already exists
-    num_users, num_movies, training_data, test_data = process_data(input_file_path)
-    print("finished processing input data")
+    writer = SummaryWriter('runs')
+    num_users, num_movies, training_data, test_data = process_data()
+    print("received input data")
     validation_data = None
-    rating_pred_model = MovieRecoModel(rank, num_users, num_movies)
-    loss_func = torch.nn.MSELoss(reduction='mean')
-    optimizer = torch.optim.SGD(rating_pred_model.parameters(), lr=learning_rate)
     num_training_data = training_data.size(0)
-    if cross_validate:
+    if CROSS_VALIDATE:
         print("cross validate was set to true, partitioning training data")
         shuffled_indices = torch.randperm(num_training_data)
         shuffled_train_data = training_data[shuffled_indices]
@@ -54,34 +81,48 @@ def train(epochs, rank, input_file_path, learning_rate, cross_validate):
         training_data = shuffled_train_data[:num_training_data]
         validation_data = shuffled_train_data[num_training_data:]
         num_validation_data = validation_data.size(0)
-    for epoch in range(epochs):
+    M = torch.zeros(num_users, num_movies, dtype=torch.float32)
+    for i, j, M_ij in training_data:
+        M[int(i.item()), int(j.item())] = M_ij.item()
+    rating_pred_model = MovieRecoModel(RANK, num_users, num_movies, M)
+    loss_func = torch.nn.MSELoss(reduction='mean')
+    optimizer = torch.optim.SGD(rating_pred_model.parameters(), lr=LEARNING_RATE)
+    for epoch in range(EPOCHS):
+        print("epoch: ", epoch)
         shuffled_indices = torch.randperm(num_training_data)
         shuffled_train_data = training_data[shuffled_indices]
-        for index in range(num_training_data):
-            print(index, num_training_data)
+        epoch_size = 10000
+        avg_train_loss = 0
+        for index in range(epoch_size):
             optimizer.zero_grad()
             i, j, M_ij = shuffled_train_data[index]
-            output = rating_pred_model(int(i), int(j))
-            loss = loss_func(output, M_ij)
+            output = rating_pred_model(torch.LongTensor([i.item()]), torch.LongTensor([j.item()]))
+            loss = loss_func(output, torch.FloatTensor([M_ij.item()]))
+            avg_train_loss += loss
             loss.backward()
             optimizer.step()
-        if cross_validate:
-            print("Cross validation results after epoch: ", epoch)
-            s = 0
-            for i, j, M_ij in validation_data:
-                s += (rating_pred_model(i, j) - M_ij) ** 2
-            print("Averaged MSE:", s / num_validation_data)
+        avg_train_loss = avg_train_loss / epoch_size
+        if CROSS_VALIDATE:
+            shuffled_indices = torch.randperm(num_validation_data)
+            shuffled_validation_data = validation_data[shuffled_indices]
+            validation_size = 1000
+            avg_test_loss = 0
+            for i, j, M_ij in shuffled_validation_data[:validation_size]:
+                avg_test_loss += \
+                    loss_func(rating_pred_model(torch.LongTensor([i.item()]), torch.LongTensor([j.item()])),
+                              torch.FloatTensor([M_ij.item()]))
+            avg_test_loss = avg_test_loss / validation_size
+        writer.add_scalar('training_loss', avg_train_loss, epoch)
+        writer.add_scalar('test_loss', avg_test_loss, epoch)
+        print("training_loss", avg_train_loss)
+        print("test_loss", avg_test_loss)
+
     # TODO: save model
     # TODO: test data output
 
 
 def main():
-    input_file_path = 'mat_comp'
-    rank = 5
-    epochs = 5
-    learning_rate = 0.001
-    cross_validate = True
-    train(epochs, rank, input_file_path, learning_rate, cross_validate)
+    train()
 
 
 if __name__ == '__main__':
