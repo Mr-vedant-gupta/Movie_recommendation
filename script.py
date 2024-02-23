@@ -127,7 +127,6 @@ def run_validation(vdn_user_indexes, vdn_movie_indexes, vdn_ratings, loss_func, 
 
 def write_predictions(model, user_indexes, movie_indexes):
     """Generate predictions for the test dataset and write to file."""
-    breakpoint()
     predictions = model(user_indexes, movie_indexes)
     with open(PREDICTIONS, "w") as file:
         for prediction in predictions:
